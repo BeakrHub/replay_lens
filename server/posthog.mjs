@@ -1,9 +1,32 @@
 import { createHash } from "node:crypto";
 
-function throttleSeconds(status, text) {
+export function throttleSeconds(status, text) {
   if (status !== 429) return null;
   const match = String(text).match(/Expected available in\s+(\d+)\s+seconds/i);
   return match ? Number(match[1]) : null;
+}
+
+export function isPostHogThrottleError(error) {
+  return Boolean(error?.source === "posthog" && error?.status === 429) ||
+    /PostHog 429|throttled|Expected available/i.test(error?.message || "");
+}
+
+export function posthogThrottleWaitSeconds(error, fallback = 60) {
+  const waitSeconds = Number(error?.throttleWaitSeconds);
+  if (Number.isFinite(waitSeconds) && waitSeconds > 0) return waitSeconds;
+  return isPostHogThrottleError(error) ? fallback : 0;
+}
+
+function makePostHogError({ response, url, body, waitSeconds }) {
+  const detail = typeof body === "string" ? body.slice(0, 800) : JSON.stringify(body);
+  const error = new Error(`PostHog ${response.status} ${response.statusText} for ${url.pathname}: ${detail}`);
+  error.source = "posthog";
+  error.status = response.status;
+  error.statusText = response.statusText;
+  error.path = url.pathname;
+  error.retryable = [429, 500, 502, 503, 504].includes(response.status);
+  if (waitSeconds !== null && waitSeconds !== undefined) error.throttleWaitSeconds = waitSeconds;
+  return error;
 }
 
 export async function posthogFetch(config, urlPath, options = {}) {
@@ -39,8 +62,12 @@ export async function posthogFetch(config, urlPath, options = {}) {
     body = JSON.parse(text);
   }
   if (!response.ok) {
-    const detail = typeof body === "string" ? body.slice(0, 800) : JSON.stringify(body);
-    throw new Error(`PostHog ${response.status} ${response.statusText} for ${url.pathname}: ${detail}`);
+    throw makePostHogError({
+      response,
+      url,
+      body,
+      waitSeconds: throttleSeconds(response.status, typeof body === "string" ? body : text)
+    });
   }
   return body;
 }

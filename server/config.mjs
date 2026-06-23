@@ -22,7 +22,8 @@ const CONFIG_KEYS = [
   "REPLAY_LENS_PASSWORD",
   "PORT",
   "POSTHOG_SNAPSHOT_CHUNK_SIZE",
-  "POSTHOG_MAX_THROTTLE_WAIT_SECONDS"
+  "POSTHOG_MAX_THROTTLE_WAIT_SECONDS",
+  "POSTHOG_JOB_THROTTLE_MAX_WAIT_SECONDS"
 ];
 
 function envValue(key, fallback = "") {
@@ -138,6 +139,7 @@ export async function saveLocalEnv(cwd, config) {
   if (config.vertexAccessToken) next.VERTEX_AI_ACCESS_TOKEN = config.vertexAccessToken;
   if (config.snapshotChunkSize) next.POSTHOG_SNAPSHOT_CHUNK_SIZE = String(config.snapshotChunkSize);
   if (config.maxThrottleWaitSeconds) next.POSTHOG_MAX_THROTTLE_WAIT_SECONDS = String(config.maxThrottleWaitSeconds);
+  if (config.jobThrottleMaxWaitSeconds) next.POSTHOG_JOB_THROTTLE_MAX_WAIT_SECONDS = String(config.jobThrottleMaxWaitSeconds);
 
   const lines = [
     "# Local Replay Lens config. This file is gitignored.",
@@ -170,7 +172,8 @@ export function getConfig() {
       1,
       MAX_POSTHOG_SNAPSHOT_CHUNK_SIZE
     ),
-    maxThrottleWaitSeconds: Number(envValue("POSTHOG_MAX_THROTTLE_WAIT_SECONDS", 0))
+    maxThrottleWaitSeconds: Number(envValue("POSTHOG_MAX_THROTTLE_WAIT_SECONDS", 0)),
+    jobThrottleMaxWaitSeconds: clampNumber(envValue("POSTHOG_JOB_THROTTLE_MAX_WAIT_SECONDS", 3600), 3600, 0, 21600)
   };
 }
 
@@ -194,6 +197,7 @@ export function publicConfig(config) {
     hasVertexAccessToken: Boolean(config.vertexAccessToken),
     hasVertexConfig,
     snapshotChunkSize: config.snapshotChunkSize,
-    maxThrottleWaitSeconds: config.maxThrottleWaitSeconds
+    maxThrottleWaitSeconds: config.maxThrottleWaitSeconds,
+    jobThrottleMaxWaitSeconds: config.jobThrottleMaxWaitSeconds
   };
 }

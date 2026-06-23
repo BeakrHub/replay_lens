@@ -37,6 +37,7 @@ const DEFAULT_FORM = {
   minClipSeconds: 12,
   maxClipSeconds: 45,
   minRecordingSeconds: 60,
+  maxRecordingSeconds: 0,
   minActiveSeconds: 0,
   minClicks: 0,
   minKeypresses: 0,
@@ -64,6 +65,7 @@ const FORM_LIMITS = {
   minClipSeconds: { label: "Min clip", min: 6, max: 60, suffix: "sec" },
   maxClipSeconds: { label: "Max clip", min: 10, max: 90, suffix: "sec" },
   minRecordingSeconds: { label: "Min recording", min: 0, max: 7200, suffix: "sec" },
+  maxRecordingSeconds: { label: "Max recording", min: 0, max: 86400, suffix: "sec" },
   minActiveSeconds: { label: "Min active", min: 0, max: 7200, suffix: "sec" },
   minClicks: { label: "Min clicks", min: 0, max: 10000 },
   minKeypresses: { label: "Min keys", min: 0, max: 100000 },
@@ -250,6 +252,9 @@ function validateForm(form) {
   if (Number(form.count) > Number(form.candidateLimit)) {
     errors.push({ keys: ["count", "candidateLimit"], message: "Candidate pool must be at least as large as Videos." });
   }
+  if (Number(form.maxRecordingSeconds) > 0 && Number(form.minRecordingSeconds) > Number(form.maxRecordingSeconds)) {
+    errors.push({ keys: ["minRecordingSeconds", "maxRecordingSeconds"], message: "Min recording must be less than or equal to Max recording, unless Max recording is 0 for unlimited." });
+  }
 
   return errors;
 }
@@ -258,6 +263,7 @@ function buildCandidateQuery(form) {
   const params = new URLSearchParams();
   appendParam(params, "limit", form.candidateLimit);
   appendParam(params, "minRecordingSeconds", form.minRecordingSeconds);
+  appendParam(params, "maxRecordingSeconds", form.maxRecordingSeconds);
   appendParam(params, "minActiveSeconds", form.minActiveSeconds);
   appendParam(params, "minClicks", form.minClicks);
   appendParam(params, "minKeypresses", form.minKeypresses);
@@ -286,6 +292,7 @@ function buildAnalyzeArgs(form) {
     ["candidate-limit", form.candidateLimit],
     ["speed", form.speed],
     ["min-recording-seconds", form.minRecordingSeconds],
+    ["max-recording-seconds", form.maxRecordingSeconds],
     ["min-active-seconds", form.minActiveSeconds],
     ["min-clicks", form.minClicks],
     ["min-keypresses", form.minKeypresses],
@@ -783,6 +790,8 @@ function AutomationPanel({ automation, loading, running, onRefresh, onRunNow }) 
       </div>
       <div className="automation-summary">
         <BatchStat label="Cadence" value={config.enabled ? `Every ${config.intervalHours}h` : "Off"} />
+        <BatchStat label="Run size" value={`${config.count || 0} at ${config.speed || 0}x`} />
+        <BatchStat label="Max length" value={config.maxRecordingSeconds ? fmtDuration(config.maxRecordingSeconds) : "unlimited"} />
         <BatchStat label="Next run" value={config.enabled ? fmtDate(runtime.nextRunAt) : "not scheduled"} />
         <BatchStat label="Seen replays" value={Number(state.seenRecordingCount || 0).toLocaleString()} />
         <BatchStat label="Open flags" value={Number(state.issueCount || 0).toLocaleString()} tone={state.issueCount ? "warn" : "good"} />
@@ -1757,6 +1766,16 @@ export default function App() {
               hint={limitHint("minRecordingSeconds")}
               invalid={invalidFields.has("minRecordingSeconds")}
               onChange={(value) => updateForm("minRecordingSeconds", value)}
+            />
+            <Field
+              label="Max recording length"
+              value={form.maxRecordingSeconds}
+              min={0}
+              max={86400}
+              suffix="sec"
+              hint={`${limitHint("maxRecordingSeconds")} · 0 unlimited`}
+              invalid={invalidFields.has("maxRecordingSeconds")}
+              onChange={(value) => updateForm("maxRecordingSeconds", value)}
             />
             <Field
               label="Min active"

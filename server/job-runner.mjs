@@ -4,7 +4,9 @@ import {
   compactRecording,
   discoverProject,
   fetchRecordingsByIds,
+  isPostHogThrottleError,
   listRecordings,
+  posthogThrottleWaitSeconds,
   querySessionRecordingIds,
   recordingActivityScore,
   recordingDuplicateKey,
@@ -27,6 +29,7 @@ export const DEFAULT_JOB_CONFIG = {
   minClipSeconds: 12,
   maxClipSeconds: 45,
   minRecordingSeconds: 60,
+  maxRecordingSeconds: 0,
   minActiveSeconds: 0,
   minClicks: 0,
   minKeypresses: 0,
@@ -90,6 +93,7 @@ export function buildJobConfig(input = {}) {
     minClipSeconds: clampNumber(input.minClipSeconds, DEFAULT_JOB_CONFIG.minClipSeconds, 6, 60),
     maxClipSeconds: clampNumber(input.maxClipSeconds, DEFAULT_JOB_CONFIG.maxClipSeconds, 10, 90),
     minRecordingSeconds: clampNumber(input.minRecordingSeconds, DEFAULT_JOB_CONFIG.minRecordingSeconds, 0, 7200),
+    maxRecordingSeconds: clampNumber(input.maxRecordingSeconds, DEFAULT_JOB_CONFIG.maxRecordingSeconds, 0, 86400),
     minActiveSeconds: clampNumber(input.minActiveSeconds, DEFAULT_JOB_CONFIG.minActiveSeconds, 0, 7200),
     minClicks: clampNumber(input.minClicks, DEFAULT_JOB_CONFIG.minClicks, 0, 10000),
     minKeypresses: clampNumber(input.minKeypresses, DEFAULT_JOB_CONFIG.minKeypresses, 0, 100000),
@@ -132,6 +136,8 @@ export function makeJob({ id = makeJobId(), artifactsRoot, config }) {
     synthesisUsage: null,
     synthesisCost: null,
     error: null,
+    stopReason: null,
+    posthogThrottle: null,
     cancelRequested: false,
     canceledAt: null,
     project: null
@@ -155,6 +161,8 @@ export function sanitizeJob(job) {
     synthesisCost: job.synthesisCost || null,
     costs: summarizeJobCosts(job),
     error: job.error,
+    stopReason: job.stopReason || null,
+    posthogThrottle: job.posthogThrottle || null,
     cancelRequested: Boolean(job.cancelRequested),
     canceledAt: job.canceledAt || null,
     project: job.project,
@@ -244,7 +252,9 @@ export function summarizeJobCosts(job) {
 
 export function applyRecordingFilters(recording, jobConfig) {
   if (!jobConfig.includeOngoing && recording.ongoing) return false;
-  if (Number(recording.recording_duration || 0) < jobConfig.minRecordingSeconds) return false;
+  const duration = Number(recording.recording_duration || 0);
+  if (duration < jobConfig.minRecordingSeconds) return false;
+  if (jobConfig.maxRecordingSeconds > 0 && duration > jobConfig.maxRecordingSeconds) return false;
   if (Number(recording.active_seconds || 0) < jobConfig.minActiveSeconds) return false;
   if (Number(recording.click_count || 0) < jobConfig.minClicks) return false;
   if (Number(recording.keypress_count || 0) < jobConfig.minKeypresses) return false;
@@ -379,10 +389,6 @@ export function selectRecordings({ recordings, jobConfig, explicitIds = new Set(
   return selected;
 }
 
-function isPostHogThrottleError(error) {
-  return /PostHog 429|throttled|Expected available/i.test(error?.message || "");
-}
-
 function shouldTryGeminiFallback(error) {
   const message = error?.message || "";
   if (!/Gemini|Vertex Gemini/i.test(message)) return false;
@@ -449,6 +455,50 @@ function isTerminalStatus(status) {
 
 function throwIfCanceled(job) {
   if (job.cancelRequested) throw cancelError();
+}
+
+function formatWait(seconds) {
+  const safeSeconds = Math.max(1, Math.round(Number(seconds || 1)));
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainingSeconds = safeSeconds % 60;
+  if (!minutes) return `${remainingSeconds}s`;
+  if (!remainingSeconds) return `${minutes}m`;
+  return `${minutes}m ${remainingSeconds}s`;
+}
+
+function waitWithCancel(job, ms) {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (job.cancelRequested || job.abortController?.signal?.aborted) {
+      reject(cancelError());
+      return;
+    }
+    let done = false;
+    const signal = job.abortController?.signal;
+    const cleanup = () => {
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
+    const finish = () => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve();
+    };
+    const onAbort = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timeout);
+      cleanup();
+      reject(cancelError());
+    };
+    const timeout = setTimeout(finish, ms);
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function jobThrottleMaxWaitSeconds(config) {
+  const parsed = Number(config?.jobThrottleMaxWaitSeconds);
+  return Number.isFinite(parsed) ? Math.max(0, parsed) : 3600;
 }
 
 export function requestJobCancel(job) {
@@ -570,9 +620,16 @@ async function processRecording({ recording, job, config, geminiConfig, projectI
     job.failures.push({
       recording: compact,
       error: error.message,
-      retryable: isPostHogThrottleError(error) || shouldTryGeminiFallback(error)
+      retryable: isPostHogThrottleError(error) || shouldTryGeminiFallback(error),
+      posthogThrottleWaitSeconds: posthogThrottleWaitSeconds(error, 60) || undefined
     });
-    return { ok: false, recording: compact, error, stop: false };
+    return {
+      ok: false,
+      recording: compact,
+      error,
+      stop: false,
+      posthogThrottleWaitSeconds: posthogThrottleWaitSeconds(error, 60) || null
+    };
   } finally {
     setRecordingStage(job, recording.id, null);
     job.progress.completed = job.results.length;
@@ -590,6 +647,54 @@ async function processCandidates({ candidates, job, config, geminiConfig, projec
   const inFlight = new Set();
   let cursor = 0;
   let stop = false;
+
+  async function applyPostHogCooldown(outcome) {
+    const requestedSeconds = Math.max(1, Math.ceil(Number(outcome.posthogThrottleWaitSeconds || 60))) + 5;
+    const maxWaitSeconds = jobThrottleMaxWaitSeconds(config);
+    const recordingId = outcome.recording?.id || "";
+    const startedAt = new Date().toISOString();
+    const waitSeconds = maxWaitSeconds > 0 ? Math.min(requestedSeconds, maxWaitSeconds) : 0;
+    const cooldownUntil = waitSeconds > 0 ? new Date(Date.now() + waitSeconds * 1000).toISOString() : null;
+
+    job.posthogThrottle = {
+      active: waitSeconds > 0 && requestedSeconds <= Math.max(waitSeconds, maxWaitSeconds),
+      recordingId,
+      requestedWaitSeconds,
+      waitSeconds,
+      maxWaitSeconds,
+      startedAt,
+      cooldownUntil
+    };
+
+    if (maxWaitSeconds > 0 && requestedSeconds > maxWaitSeconds) {
+      stop = true;
+      job.stopReason = `PostHog throttled for ${formatWait(requestedSeconds)}, which is above the configured ${formatWait(maxWaitSeconds)} job wait cap.`;
+      job.progress.message = `${job.stopReason} The next scheduled run can retry unfinished recordings.`;
+      await persist();
+      return;
+    }
+
+    if (waitSeconds <= 0) {
+      stop = true;
+      job.stopReason = `PostHog throttled for ${formatWait(requestedSeconds)} and job-level waiting is disabled.`;
+      job.progress.message = `${job.stopReason} The next scheduled run can retry unfinished recordings.`;
+      await persist();
+      return;
+    }
+
+    job.progress.message = `PostHog throttled on ${recordingId}; waiting ${formatWait(waitSeconds)} before the next replay.`;
+    await persist();
+    await waitWithCancel(job, waitSeconds * 1000);
+    if (job.posthogThrottle?.startedAt === startedAt) {
+      job.posthogThrottle = {
+        ...job.posthogThrottle,
+        active: false,
+        completedAt: new Date().toISOString()
+      };
+      job.progress.message = "PostHog cooldown finished; continuing batch";
+      await persist();
+    }
+  }
 
   function launchAvailable() {
     while (
@@ -614,6 +719,7 @@ async function processCandidates({ candidates, job, config, geminiConfig, projec
     const outcome = await Promise.race(inFlight);
     if (outcome?.stop) stop = true;
     if (outcome?.canceled || job.cancelRequested) stop = true;
+    if (!stop && outcome?.posthogThrottleWaitSeconds) await applyPostHogCooldown(outcome);
     launchAvailable();
   }
 }
@@ -683,7 +789,7 @@ export async function runJob({ job, config, save = saveJob }) {
     job.progress.currentRecordingId = null;
     if (job.status === "completed") job.progress.message = "Done";
     else if (job.status === "canceled") job.progress.message = `Canceled; saved ${job.results.length} completed result${job.results.length === 1 ? "" : "s"}`;
-    else job.progress.message = "Stopped before target count";
+    else job.progress.message = job.stopReason || "Stopped before target count";
     await persist();
   } catch (error) {
     if (isCanceledError(error) || job.cancelRequested) {

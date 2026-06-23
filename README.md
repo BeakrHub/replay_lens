@@ -16,7 +16,7 @@ Replay Lens is an independent open-source tool. It is not affiliated with, spons
 - Sends generated MP4 clips to Gemini with a strict evidence-focused bug prompt.
 - Retries transient Gemini API failures before marking a recording failed.
 - Falls back from the configured Gemini model to `gemini-3-flash-preview` and then `gemini-2.5-flash` for retryable Gemini capacity/rate-limit errors.
-- Treats per-recording PostHog snapshot throttles as retryable recording failures instead of stopping the whole batch.
+- Treats PostHog snapshot throttles as retryable failures and pauses the batch until PostHog's returned cooldown window expires.
 - Can process multiple replay render/Gemini jobs in parallel with a per-run concurrency limit.
 - Supports Google AI Studio API keys and Vertex AI / GCP Gemini credentials.
 - Lets each UI or cron run override the Gemini model string.
@@ -136,6 +136,7 @@ GEMINI_REPLAY_MODEL=gemini-3.5-flash
 REPLAY_LENS_PASSWORD=...
 POSTHOG_SNAPSHOT_CHUNK_SIZE=20
 POSTHOG_MAX_THROTTLE_WAIT_SECONDS=90
+POSTHOG_JOB_THROTTLE_MAX_WAIT_SECONDS=3600
 ```
 
 Railway provides `PORT`; do not hard-code it. In production the server binds `0.0.0.0:$PORT`.
@@ -152,6 +153,7 @@ AUTOMATION_COUNT=10
 AUTOMATION_PARALLELISM=2
 AUTOMATION_CANDIDATE_LIMIT=150
 AUTOMATION_MAX_AGE_DAYS=7
+AUTOMATION_MAX_RECORDING_SECONDS=7200
 AUTOMATION_MIN_ACTIVE_SECONDS=20
 AUTOMATION_MIN_ACTIVITY_SCORE=10
 AUTOMATION_MAX_PER_USER=1
@@ -240,7 +242,8 @@ Session replays may contain sensitive user data. Review your PostHog masking con
 - If the UI shows `Cannot GET /api/gemini/models`, restart `npm run dev`. That means the browser is talking to a stale local API process without the model-discovery route.
 - If model refresh fails, the UI falls back to curated Gemini model names so you can still type or select a model manually.
 - If Gemini returns a transient `500`/`503`/`429`, Replay Lens retries with backoff, then falls back to `gemini-3-flash-preview` and `gemini-2.5-flash` before recording the failure.
-- If PostHog returns a long `429` snapshot throttle, Replay Lens records that replay as a retryable failure and continues with the next candidate. Failed recordings are not added to the automation seen ledger, so later scheduled runs can retry them.
+- If PostHog returns a long `429` snapshot throttle, Replay Lens records that replay as a retryable failure, waits for PostHog's returned cooldown window, then continues instead of burning through the rest of the batch. `POSTHOG_JOB_THROTTLE_MAX_WAIT_SECONDS` caps that job-level wait; failed recordings are not added to the automation seen ledger, so later scheduled runs can retry them.
+- If scheduled runs keep hitting PostHog snapshot throttles, lower `AUTOMATION_CANDIDATE_LIMIT`, keep `AUTOMATION_PARALLELISM=1`, and set `AUTOMATION_MAX_RECORDING_SECONDS` to avoid very long sessions that require large snapshot downloads before inactive periods can be compressed.
 - If a batch returns `partial`, check the failure list in the active batch panel. PostHog throttling, blank renders, and inaccessible Gemini models are surfaced there.
 - If the local dev server restarts during a batch, Replay Lens marks the saved batch as `partial` on the next refresh because the in-memory worker is gone.
 - If you filter to a single user and get too few recordings, raise **Max/user** or set `--max-per-user 0`.

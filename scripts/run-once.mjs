@@ -20,6 +20,7 @@ const FLAG_MAP = {
   "max-age-days": "maxAgeDays",
   "max-clip-seconds": "maxClipSeconds",
   "max-per-user": "maxPerUser",
+  "max-recording-seconds": "maxRecordingSeconds",
   "min-active-seconds": "minActiveSeconds",
   "min-activity-score": "minActivityScore",
   "min-clicks": "minClicks",
@@ -69,6 +70,7 @@ Useful flags:
   --speed 12
   --gemini-model gemini-3.1-pro-preview
   --min-recording-seconds 60
+  --max-recording-seconds 7200
   --min-active-seconds 20
   --min-activity-score 10
   --min-clicks 2
