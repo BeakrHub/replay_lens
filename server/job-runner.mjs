@@ -15,6 +15,8 @@ import {
 import { renderReplayClip } from "./replay.mjs";
 import { analyzeReplayWithGeminiDetailed, synthesizeBatchDetailed } from "./gemini.mjs";
 
+const GEMINI_FALLBACK_MODELS = ["gemini-3-flash-preview", "gemini-2.5-flash"];
+
 export const DEFAULT_JOB_CONFIG = {
   count: 10,
   parallelism: 1,
@@ -377,8 +379,57 @@ export function selectRecordings({ recordings, jobConfig, explicitIds = new Set(
   return selected;
 }
 
-function isCapacityError(error) {
-  return /429|quota|rate limit|rate-limit|throttled|Expected available/i.test(error?.message || "");
+function isPostHogThrottleError(error) {
+  return /PostHog 429|throttled|Expected available/i.test(error?.message || "");
+}
+
+function shouldTryGeminiFallback(error) {
+  const message = error?.message || "";
+  if (!/Gemini|Vertex Gemini/i.test(message)) return false;
+  return /408|409|429|500|502|503|504|quota|rate limit|rate-limit|RESOURCE_EXHAUSTED|UNAVAILABLE|INTERNAL/i.test(message);
+}
+
+function fallbackGeminiModels(primaryModel) {
+  const seen = new Set();
+  return [primaryModel, ...GEMINI_FALLBACK_MODELS]
+    .map((model) => String(model || "").trim())
+    .filter((model) => {
+      if (!model || seen.has(model)) return false;
+      seen.add(model);
+      return true;
+    });
+}
+
+async function analyzeWithGeminiFallbacks({ geminiConfig, mp4Path, metadata, analysisFocus, signal }) {
+  const models = fallbackGeminiModels(geminiConfig.geminiModel);
+  const errors = [];
+  let lastError = null;
+
+  for (const model of models) {
+    try {
+      const result = await analyzeReplayWithGeminiDetailed({
+        config: { ...geminiConfig, geminiModel: model },
+        mp4Path,
+        metadata: { ...metadata, geminiModel: model },
+        analysisFocus,
+        signal
+      });
+      return {
+        ...result,
+        modelUsed: model,
+        fallbackErrors: errors
+      };
+    } catch (error) {
+      lastError = error;
+      errors.push({ model, error: error.message });
+      if (!shouldTryGeminiFallback(error)) break;
+    }
+  }
+
+  if (errors.length > 1) {
+    lastError.message = `${lastError.message} Gemini fallback attempts: ${errors.map((item) => `${item.model}: ${item.error}`).join(" | ")}`;
+  }
+  throw lastError;
 }
 
 function cancelError() {
@@ -475,13 +526,12 @@ async function processRecording({ recording, job, config, geminiConfig, projectI
     throwIfCanceled(job);
     setRecordingStage(job, recording.id, "analyzing");
     await persist();
-    const analysisResult = await analyzeReplayWithGeminiDetailed({
-      config: geminiConfig,
+    const analysisResult = await analyzeWithGeminiFallbacks({
+      geminiConfig,
       mp4Path: clip.mp4Path,
       metadata: {
         ...clip.metadata,
-        analysisFocus: job.config.analysisFocus || undefined,
-        geminiModel: geminiConfig.geminiModel
+        analysisFocus: job.config.analysisFocus || undefined
       },
       analysisFocus: job.config.analysisFocus,
       signal: job.abortController?.signal
@@ -490,7 +540,9 @@ async function processRecording({ recording, job, config, geminiConfig, projectI
     const metadata = {
       ...clip.metadata,
       geminiUsage: analysisResult.usageMetadata,
-      geminiCost: analysisResult.cost
+      geminiCost: analysisResult.cost,
+      geminiModelUsed: analysisResult.modelUsed,
+      geminiFallbackErrors: analysisResult.fallbackErrors
     };
     const analysisPath = path.join(recordingDir, "analysis.json");
     await fs.writeFile(analysisPath, JSON.stringify(analysis, null, 2));
@@ -515,8 +567,12 @@ async function processRecording({ recording, job, config, geminiConfig, projectI
     if (isCanceledError(error) || job.cancelRequested) {
       return { ok: false, recording: compact, canceled: true };
     }
-    job.failures.push({ recording: compact, error: error.message });
-    return { ok: false, recording: compact, error, stop: isCapacityError(error) };
+    job.failures.push({
+      recording: compact,
+      error: error.message,
+      retryable: isPostHogThrottleError(error) || shouldTryGeminiFallback(error)
+    });
+    return { ok: false, recording: compact, error, stop: false };
   } finally {
     setRecordingStage(job, recording.id, null);
     job.progress.completed = job.results.length;

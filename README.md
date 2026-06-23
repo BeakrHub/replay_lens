@@ -15,6 +15,8 @@ Replay Lens is an independent open-source tool. It is not affiliated with, spons
 - Removes long inactive replay gaps before recording the MP4 so Gemini spends budget on active behavior.
 - Sends generated MP4 clips to Gemini with a strict evidence-focused bug prompt.
 - Retries transient Gemini API failures before marking a recording failed.
+- Falls back from the configured Gemini model to `gemini-3-flash-preview` and then `gemini-2.5-flash` for retryable Gemini capacity/rate-limit errors.
+- Treats per-recording PostHog snapshot throttles as retryable recording failures instead of stopping the whole batch.
 - Can process multiple replay render/Gemini jobs in parallel with a per-run concurrency limit.
 - Supports Google AI Studio API keys and Vertex AI / GCP Gemini credentials.
 - Lets each UI or cron run override the Gemini model string.
@@ -237,7 +239,8 @@ Session replays may contain sensitive user data. Review your PostHog masking con
 
 - If the UI shows `Cannot GET /api/gemini/models`, restart `npm run dev`. That means the browser is talking to a stale local API process without the model-discovery route.
 - If model refresh fails, the UI falls back to curated Gemini model names so you can still type or select a model manually.
-- If Gemini returns a transient `500`/`503`/`429`, Replay Lens retries with backoff before recording the failure. If it still fails after retries, lower **Parallel jobs** or try a different Gemini model/provider.
+- If Gemini returns a transient `500`/`503`/`429`, Replay Lens retries with backoff, then falls back to `gemini-3-flash-preview` and `gemini-2.5-flash` before recording the failure.
+- If PostHog returns a long `429` snapshot throttle, Replay Lens records that replay as a retryable failure and continues with the next candidate. Failed recordings are not added to the automation seen ledger, so later scheduled runs can retry them.
 - If a batch returns `partial`, check the failure list in the active batch panel. PostHog throttling, blank renders, and inaccessible Gemini models are surfaced there.
 - If the local dev server restarts during a batch, Replay Lens marks the saved batch as `partial` on the next refresh because the in-memory worker is gone.
 - If you filter to a single user and get too few recordings, raise **Max/user** or set `--max-per-user 0`.
