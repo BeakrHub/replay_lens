@@ -659,7 +659,7 @@ async function processCandidates({ candidates, job, config, geminiConfig, projec
     job.posthogThrottle = {
       active: waitSeconds > 0 && requestedSeconds <= Math.max(waitSeconds, maxWaitSeconds),
       recordingId,
-      requestedWaitSeconds,
+      requestedWaitSeconds: requestedSeconds,
       waitSeconds,
       maxWaitSeconds,
       startedAt,
