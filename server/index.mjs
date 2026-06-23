@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +25,7 @@ const repoRoot = path.resolve(__dirname, "..");
 const artifactsRoot = path.join(repoRoot, "artifacts");
 const jobs = new Map();
 const jobPromises = new Map();
+const authCookieName = "replay_lens_session";
 
 async function getJobById(id) {
   const runtimeJob = jobs.get(id);
@@ -84,11 +86,173 @@ async function stopRuntimeJob(job) {
   return job;
 }
 
+function htmlEscape(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function parseCookies(header = "") {
+  const cookies = {};
+  for (const part of header.split(";")) {
+    const index = part.indexOf("=");
+    if (index === -1) continue;
+    const key = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim();
+    if (!key) continue;
+    try {
+      cookies[key] = decodeURIComponent(value);
+    } catch {
+      cookies[key] = value;
+    }
+  }
+  return cookies;
+}
+
+function authPassword() {
+  return String(process.env.REPLAY_LENS_PASSWORD || "").trim();
+}
+
+function safeRedirect(input) {
+  const target = String(input || "/");
+  if (target.startsWith("/") && !target.startsWith("//")) return target;
+  return "/";
+}
+
+function timingSafeTextEqual(left, right) {
+  const leftHash = crypto.createHash("sha256").update(String(left)).digest();
+  const rightHash = crypto.createHash("sha256").update(String(right)).digest();
+  return crypto.timingSafeEqual(leftHash, rightHash);
+}
+
+function signSession(expiresAt, password) {
+  return crypto.createHmac("sha256", password).update(String(expiresAt)).digest("base64url");
+}
+
+function makeSessionToken(password) {
+  const expiresAt = Date.now() + 1000 * 60 * 60 * 24 * 14;
+  return `${expiresAt}.${signSession(expiresAt, password)}`;
+}
+
+function hasValidSession(req, password) {
+  const token = parseCookies(req.headers.cookie)[authCookieName];
+  if (!token || !token.includes(".")) return false;
+  const [expiresAt, signature] = token.split(".");
+  const expires = Number(expiresAt);
+  if (!Number.isFinite(expires) || expires < Date.now()) return false;
+  return timingSafeTextEqual(signature, signSession(expiresAt, password));
+}
+
+function renderLoginPage({ error = "", next = "/" } = {}) {
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Replay Lens Sign In</title>
+    <style>
+      :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f7fb; color: #111827; }
+      main { width: min(420px, calc(100vw - 40px)); border: 1px solid #d8dee9; border-radius: 12px; background: #fff; box-shadow: 0 18px 50px rgb(15 23 42 / 10%); padding: 28px; }
+      .eyebrow { margin: 0 0 8px; color: #3155b7; font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+      h1 { margin: 0 0 10px; font-size: 26px; line-height: 1.15; }
+      p { margin: 0 0 20px; color: #596273; line-height: 1.5; }
+      label { display: block; margin: 0 0 8px; color: #424b5c; font-size: 14px; font-weight: 700; }
+      input { box-sizing: border-box; width: 100%; height: 48px; border: 1px solid #cfd6e2; border-radius: 8px; padding: 0 14px; font: inherit; font-weight: 650; outline: none; }
+      input:focus { border-color: #3155b7; box-shadow: 0 0 0 3px rgb(49 85 183 / 15%); }
+      button { width: 100%; height: 48px; margin-top: 14px; border: 0; border-radius: 8px; background: #3155b7; color: #fff; font: inherit; font-weight: 800; cursor: pointer; }
+      .error { margin: 0 0 14px; border: 1px solid #fecaca; border-radius: 8px; background: #fff1f2; color: #991b1b; padding: 10px 12px; font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Team Access</p>
+      <h1>Replay Lens</h1>
+      <p>Enter the team password to view replay analyses, API data, and generated artifacts.</p>
+      ${error ? `<div class="error">${htmlEscape(error)}</div>` : ""}
+      <form method="post" action="/login">
+        <input type="hidden" name="next" value="${htmlEscape(next)}" />
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" autofocus required />
+        <button type="submit">Continue</button>
+      </form>
+    </main>
+  </body>
+</html>`;
+}
+
+function requirePasswordGate(req, res, next) {
+  const password = authPassword();
+  if (!password) {
+    next();
+    return;
+  }
+  if (hasValidSession(req, password)) {
+    next();
+    return;
+  }
+  if (req.path.startsWith("/api")) {
+    res.status(401).json({ error: "Authentication required." });
+    return;
+  }
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    res.status(401).send("Authentication required.");
+    return;
+  }
+  res.redirect(`/login?next=${encodeURIComponent(req.originalUrl || "/")}`);
+}
+
 await loadDotEnv(repoRoot);
 await fs.mkdir(artifactsRoot, { recursive: true });
 
 const app = express();
+app.set("trust proxy", 1);
 app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: false, limit: "20kb" }));
+
+app.get("/login", (req, res) => {
+  if (!authPassword()) {
+    res.redirect("/");
+    return;
+  }
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(renderLoginPage({ next: safeRedirect(req.query.next) }));
+});
+
+app.post("/login", (req, res) => {
+  const password = authPassword();
+  if (!password) {
+    res.redirect("/");
+    return;
+  }
+  const next = safeRedirect(req.body?.next);
+  if (!timingSafeTextEqual(req.body?.password || "", password)) {
+    res.status(401).setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(renderLoginPage({ error: "Incorrect password.", next }));
+    return;
+  }
+  res.cookie(authCookieName, makeSessionToken(password), {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 1000 * 60 * 60 * 24 * 14
+  });
+  res.redirect(next);
+});
+
+app.post("/logout", (_req, res) => {
+  res.clearCookie(authCookieName, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production"
+  });
+  res.redirect("/login");
+});
+
+app.use(requirePasswordGate);
 app.use("/artifacts", express.static(artifactsRoot));
 
 app.get("/api/health", async (_req, res) => {

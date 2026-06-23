@@ -129,11 +129,14 @@ POSTHOG_API_HOST=https://us.posthog.com
 GEMINI_PROVIDER=ai-studio
 GOOGLE_AI_API_KEY=...
 GEMINI_REPLAY_MODEL=gemini-3.5-flash
+REPLAY_LENS_PASSWORD=...
 POSTHOG_SNAPSHOT_CHUNK_SIZE=20
 POSTHOG_MAX_THROTTLE_WAIT_SECONDS=90
 ```
 
 Railway provides `PORT`; do not hard-code it. In production the server binds `0.0.0.0:$PORT`.
+
+When `REPLAY_LENS_PASSWORD` is set, the web UI, API, and generated replay artifacts require a password session cookie. Leave it unset only for local-only development.
 
 For an automated scheduled loop, create a second Railway service from the same repo, set the same variables, set its start command to a one-off analysis, and configure Railway's **Cron Schedule**:
 
